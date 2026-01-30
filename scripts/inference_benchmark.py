@@ -1,7 +1,8 @@
 import argparse
+import copy
 import statistics
 import time
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -10,6 +11,12 @@ from ase import build
 from mace import data as mace_data
 from mace.calculators.foundations_models import mace_mp
 from mace.tools import AtomicNumberTable, torch_geometric, torch_tools
+from mace.tools.int8_quantization import (
+    calibrate_model,
+    convert_static_int8,
+    model_bytes,
+    prepare_static_int8,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,16 +39,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fullgraph", action="store_true")
     parser.add_argument(
-        "--compare-quant",
+        "--int8",
         action="store_true",
-        help="Run FP32 vs INT8 quantized comparison (CPU only).",
+        help="Run FP32 vs INT8 static quantized comparison (INT8 on CPU only).",
+    )
+    parser.add_argument(
+        "--calib-iters",
+        type=int,
+        default=50,
+        help="Calibration iterations for static PTQ INT8.",
+    )
+    parser.add_argument(
+        "--cpu-baseline",
+        action="store_true",
+        help="Also run FP32 on CPU for INT8 speedup comparison.",
     )
     parser.add_argument(
         "--quant-backend",
         type=str,
         default="fbgemm",
         choices=("fbgemm", "qnnpack"),
-        help="Quantized backend to use when --compare-quant is set.",
+        help="Quantized backend to use when --int8 is set.",
     )
     return parser.parse_args()
 
@@ -140,11 +158,9 @@ def summarize(latencies: List[float]) -> Tuple[float, float]:
     return statistics.mean(latencies), statistics.stdev(latencies)
 
 
-def quantize_model(model: torch.nn.Module) -> torch.nn.Module:
-    model.eval()
-    return torch.ao.quantization.quantize_dynamic(
-        model, {torch.nn.Linear}, dtype=torch.qint8
-    )
+def batch_repeat(batch: dict, iters: int) -> Iterable[dict]:
+    for _ in range(iters):
+        yield batch
 
 
 def print_benchmark_summary(
@@ -154,7 +170,7 @@ def print_benchmark_summary(
     batch: dict,
     mean_latency: float,
     std_latency: float,
-    quantized: bool = False,
+    dtype_label: Optional[str] = None,
 ) -> None:
     num_atoms = int(batch["positions"].shape[0])
     num_edges = int(batch["edge_index"].shape[1])
@@ -162,7 +178,7 @@ def print_benchmark_summary(
     ns_per_day = 0.0864 / mean_latency if mean_latency > 0 else float("inf")
 
     print(title)
-    dtype_label = "int8 (dynamic)" if quantized else args.dtype
+    dtype_label = dtype_label or args.dtype
     print(f"Model: {args.model}")
     print(f"Device: {device}")
     print(f"Dtype: {dtype_label}")
@@ -170,8 +186,6 @@ def print_benchmark_summary(
     print(f"Fullgraph: {args.fullgraph}")
     if args.threads is not None and device.type == "cpu":
         print(f"CPU threads: {torch.get_num_threads()}")
-    if quantized:
-        print(f"Quantized backend: {torch.backends.quantized.engine}")
     print(f"Num atoms: {num_atoms}")
     print(f"Num edges: {num_edges}")
     print(f"Iters per repeat: {args.iters}")
@@ -182,15 +196,65 @@ def print_benchmark_summary(
     print(f"ns/day (1 fs/step): {ns_per_day:.2f}")
 
 
+def print_int8_validation(float_model: torch.nn.Module, int8_model: torch.nn.Module):
+    quant_modules = [
+        module
+        for module in int8_model.modules()
+        if isinstance(
+            module, (torch.nn.quantized.Linear, torch.nn.quantized.Embedding)
+        )
+    ]
+    module_types = [type(module).__name__ for module in quant_modules[:5]]
+    print(f"INT8 module types (sample): {module_types or 'None found'}")
+
+    weight_samples = []
+    for name, module in int8_model.named_modules():
+        weight = getattr(module, "weight", None)
+        if isinstance(weight, torch.Tensor):
+            weight_samples.append(
+                (
+                    name,
+                    str(weight.dtype),
+                    weight.is_quantized,
+                )
+            )
+        if len(weight_samples) >= 5:
+            break
+    print(f"INT8 weight dtype samples: {weight_samples or 'None found'}")
+
+    state_dict = int8_model.state_dict()
+    quant_keys = [
+        key
+        for key, value in state_dict.items()
+        if isinstance(value, torch.Tensor)
+        and (value.is_quantized or value.dtype in (torch.qint8, torch.quint8))
+    ]
+    packed_keys = [
+        key
+        for key, value in state_dict.items()
+        if "packed" in key or not isinstance(value, torch.Tensor)
+    ]
+    print(
+        f"INT8 state_dict qint8/quint8 keys (sample): {quant_keys[:5] or 'None found'}"
+    )
+    print(
+        f"INT8 state_dict packed keys (sample): {packed_keys[:5] or 'None found'}"
+    )
+
+    float_bytes = model_bytes(float_model.state_dict())
+    int8_bytes = model_bytes(int8_model.state_dict())
+    print(
+        "Model size (state_dict): "
+        f"FP32 {float_bytes / 1e6:.2f} MB -> INT8 {int8_bytes / 1e6:.2f} MB"
+    )
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     device = torch.device(args.device)
-    if args.compare_quant and device.type != "cpu":
-        print("WARNING: --compare-quant is CPU-only; switching device to CPU.")
-        device = torch.device("cpu")
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA device requested but not available")
 
@@ -231,34 +295,87 @@ def main() -> None:
         std_latency,
     )
 
-    if args.compare_quant:
-        if device.type != "cpu":
-            raise RuntimeError("--compare-quant requires CPU execution")
+    if args.int8:
         if args.dtype != "float32":
-            print("WARNING: quantization expects float32 weights; using float32.")
-        quant_model = quantize_model(model)
-        quant_latencies = run_benchmark(
-            quant_model,
-            batch,
-            compute_force=args.compute_force,
+            print("WARNING: INT8 quantization expects float32 weights; using float32.")
+        if args.compute_force:
+            print("WARNING: INT8 path does not support force computation; disabling.")
+        print("INT8 CPU only.")
+
+        cpu_device = torch.device("cpu")
+        if args.threads is not None:
+            torch.set_num_threads(args.threads)
+        torch.backends.quantized.engine = args.quant_backend
+
+        with torch_tools.default_dtype("float32"):
+            float_model_cpu = load_model(
+                args.model,
+                "float32",
+                cpu_device,
+                compile_mode=None,
+                fullgraph=args.fullgraph,
+            )
+            batch_cpu = create_batch(
+                args.size,
+                float_model_cpu,
+                cpu_device,
+                compute_force=False,
+            )
+
+        if args.cpu_baseline:
+            cpu_latencies = run_benchmark(
+                float_model_cpu,
+                batch_cpu,
+                compute_force=False,
+                training=False,
+                warmup=args.warmup,
+                iters=args.iters,
+                repeats=args.repeats,
+                device=cpu_device,
+            )
+            cpu_mean, cpu_std = summarize(cpu_latencies)
+            print_benchmark_summary(
+                "== MACE Inference Benchmark (FP32 CPU) ==",
+                args,
+                cpu_device,
+                batch_cpu,
+                cpu_mean,
+                cpu_std,
+                dtype_label="float32",
+            )
+
+        int8_model = prepare_static_int8(
+            copy.deepcopy(float_model_cpu), backend=args.quant_backend
+        )
+        calibrate_model(int8_model, batch_repeat(batch_cpu, args.calib_iters))
+        int8_model = convert_static_int8(int8_model)
+
+        print_int8_validation(float_model_cpu, int8_model)
+        print(f"Quantized backend: {torch.backends.quantized.engine}")
+
+        int8_latencies = run_benchmark(
+            int8_model,
+            batch_cpu,
+            compute_force=False,
             training=False,
             warmup=args.warmup,
             iters=args.iters,
             repeats=args.repeats,
-            device=device,
+            device=cpu_device,
         )
-        quant_mean, quant_std = summarize(quant_latencies)
+        int8_mean, int8_std = summarize(int8_latencies)
         print_benchmark_summary(
-            "== MACE Inference Benchmark (INT8) ==",
+            "== MACE Inference Benchmark (INT8 CPU) ==",
             args,
-            device,
-            batch,
-            quant_mean,
-            quant_std,
-            quantized=True,
+            cpu_device,
+            batch_cpu,
+            int8_mean,
+            int8_std,
+            dtype_label="int8 (static)",
         )
-        speedup = mean_latency / quant_mean if quant_mean > 0 else float("inf")
-        print(f"Speedup (FP32/INT8): {speedup:.2f}x")
+        if args.cpu_baseline:
+            speedup_cpu = cpu_mean / int8_mean if int8_mean > 0 else float("inf")
+            print(f"Speedup CPU (FP32/INT8): {speedup_cpu:.2f}x")
 
 
 if __name__ == "__main__":
