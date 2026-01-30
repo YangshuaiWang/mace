@@ -426,13 +426,17 @@ class MACE(torch.nn.Module):
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
-            node_feats = self.node_feat_quantizers[i](node_feats)
+            node_feat_quantizers = getattr(self, "node_feat_quantizers", None)
+            if node_feat_quantizers is not None:
+                node_feats = node_feat_quantizers[i](node_feats)
             node_feats_concat.append(node_feats)
 
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
             node_es_full = readout(node_feats_concat[feat_idx], node_heads)
-            node_es_full = self.readout_quants[i](node_es_full)
+            readout_quants = getattr(self, "readout_quants", None)
+            if readout_quants is not None:
+                node_es_full = readout_quants[i](node_es_full)
             node_es = node_es_full[num_atoms_arange, node_heads]
             energy = scatter_sum(node_es, data["batch"], dim=0, dim_size=num_graphs)
             energies.append(energy)
@@ -612,13 +616,17 @@ class ScaleShiftMACE(MACE):
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
-            node_feats = self.node_feat_quantizers[i](node_feats)
+            node_feat_quantizers = getattr(self, "node_feat_quantizers", None)
+            if node_feat_quantizers is not None:
+                node_feats = node_feat_quantizers[i](node_feats)
             node_feats_list.append(node_feats)
 
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
             node_es_full = readout(node_feats_list[feat_idx], node_heads)
-            node_es_full = self.readout_quants[i](node_es_full)
+            readout_quants = getattr(self, "readout_quants", None)
+            if readout_quants is not None:
+                node_es_full = readout_quants[i](node_es_full)
             node_es_list.append(node_es_full[num_atoms_arange, node_heads])
 
         node_feats_out = torch.cat(node_feats_list, dim=-1)
