@@ -301,6 +301,12 @@ class MACE(torch.nn.Module):
     def set_quantization(self, enabled: bool) -> None:
         set_quantization_active(self, enabled)
 
+    def _quantize_edge_feats(self, edge_feats: torch.Tensor) -> torch.Tensor:
+        edge_quant = getattr(self, "edge_feat_quant", None)
+        if edge_quant is None:
+            return edge_feats
+        return edge_quant(edge_feats)
+
     def forward(
         self,
         data: Dict[str, torch.Tensor],
@@ -350,7 +356,7 @@ class MACE(torch.nn.Module):
         edge_feats, cutoff = self.radial_embedding(
             lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
         )
-        edge_feats = self.edge_feat_quant(edge_feats)
+        edge_feats = self._quantize_edge_feats(edge_feats)
         if hasattr(self, "pair_repulsion"):
             pair_node_energy = self.pair_repulsion_fn(
                 lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
@@ -546,7 +552,7 @@ class ScaleShiftMACE(MACE):
         else:
             pair_node_energy = torch.zeros_like(node_e0)
 
-        edge_feats = self.edge_feat_quant(edge_feats)
+        edge_feats = self._quantize_edge_feats(edge_feats)
 
         # Embeddings of additional features
         if hasattr(self, "joint_embedding"):
