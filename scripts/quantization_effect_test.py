@@ -1,4 +1,6 @@
 import argparse
+import sys
+
 import numpy as np
 import torch
 from e3nn import o3
@@ -11,14 +13,6 @@ from mace.modules.blocks import (
 from mace.modules.models import MACE
 from mace.modules.quantization import QuantizationConfig
 from mace.tools.torch_geometric import Batch
-
-
-def random_rotation(device: torch.device) -> torch.Tensor:
-    matrix = torch.randn(3, 3, device=device)
-    q, _ = torch.linalg.qr(matrix)
-    if torch.det(q) < 0:
-        q[:, 0] = -q[:, 0]
-    return q
 
 
 def build_batch(positions: torch.Tensor, num_elements: int) -> dict:
@@ -64,19 +58,26 @@ def build_batch(positions: torch.Tensor, num_elements: int) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Quantization sanity check")
+    parser = argparse.ArgumentParser(
+        description="Check that quantization changes MACE outputs."
+    )
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--disable-quantization",
-        action="store_true",
-        help="Disable quantization (default: enabled)",
+        "--min-delta",
+        type=float,
+        default=1e-6,
+        help="Minimum absolute delta to treat quantization as effective.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    device = torch.device("cpu")
+    device = torch.device(args.device)
     torch.set_default_dtype(torch.float32)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     quant_config = QuantizationConfig(
         enable_ptq=True,
@@ -114,36 +115,30 @@ def main() -> None:
     )
     batch = build_batch(positions, num_elements=1)
 
-    quant_enabled = not args.disable_quantization
-    model.set_quantization(quant_enabled)
-    output = model(batch, compute_force=True)
-    energy = output["energy"]
-    forces = output["forces"]
-    print(f"Quant energy: {energy.detach().cpu().numpy()}")
-    print(f"Quant forces norm: {forces.norm(dim=1).detach().cpu().numpy()}")
-
-    rotation = random_rotation(device)
-    positions_rot = positions @ rotation.T
-    batch_rot = build_batch(positions_rot, num_elements=1)
-    output_rot = model(batch_rot, compute_force=True)
-    energy_rot = output_rot["energy"]
-    forces_rot = output_rot["forces"]
-
-    energy_err = (energy - energy_rot).abs().max()
-    forces_expected = forces @ rotation.T
-    force_err = (forces_expected - forces_rot).norm(dim=1).max()
-    print(f"Energy rotation error: {energy_err.item():.6f}")
-    print(f"Force rotation error: {force_err.item():.6f}")
+    model.set_quantization(True)
+    output_quant = model(batch, compute_force=True)
+    energy_quant = output_quant["energy"]
+    forces_quant = output_quant["forces"]
 
     model.set_quantization(False)
     output_fp = model(batch, compute_force=True)
     energy_fp = output_fp["energy"]
-    print(
-        f"FP32 energy delta vs quant: {(energy_fp - energy).abs().max().item():.6f}"
-    )
+    forces_fp = output_fp["forces"]
+
+    energy_delta = (energy_quant - energy_fp).abs().max().item()
+    force_delta = (forces_quant - forces_fp).abs().max().item()
+
+    print(f"Energy delta (quant vs fp32): {energy_delta:.6f}")
+    print(f"Force delta (quant vs fp32): {force_delta:.6f}")
+
+    if energy_delta <= args.min_delta and force_delta <= args.min_delta:
+        print(
+            "Quantization did not introduce a measurable delta. "
+            "Try reducing --min-delta or adjusting the model setup."
+        )
+        sys.exit(1)
+    print("Quantization effect detected.")
 
 
 if __name__ == "__main__":
-    torch.manual_seed(0)
-    np.random.seed(0)
     main()
