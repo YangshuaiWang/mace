@@ -61,6 +61,11 @@ def parse_args() -> argparse.Namespace:
         choices=("fbgemm", "qnnpack"),
         help="Quantized backend to use when --int8 is set.",
     )
+    parser.add_argument(
+        "--int8-debug",
+        action="store_true",
+        help="Print quantizable module/qconfig details for INT8 debugging.",
+    )
     return parser.parse_args()
 
 
@@ -249,6 +254,27 @@ def print_int8_validation(float_model: torch.nn.Module, int8_model: torch.nn.Mod
     )
 
 
+def print_int8_debug(float_model: torch.nn.Module) -> None:
+    quantizable = []
+    for name, module in float_model.named_modules():
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+            quantizable.append((name, type(module).__name__, module.qconfig))
+    print("INT8 debug: quantizable Linear/Embedding modules (first 20):")
+    for name, module_type, qconfig in quantizable[:20]:
+        print(f"  - {name}: {module_type}, qconfig={qconfig}")
+    print(f"INT8 debug: total quantizable modules: {len(quantizable)}")
+
+    qconfig_modules = [
+        (name, type(module).__name__, module.qconfig)
+        for name, module in float_model.named_modules()
+        if getattr(module, "qconfig", None) is not None
+    ]
+    print("INT8 debug: modules with qconfig set (first 20):")
+    for name, module_type, qconfig in qconfig_modules[:20]:
+        print(f"  - {name}: {module_type}, qconfig={qconfig}")
+    print(f"INT8 debug: total modules with qconfig: {len(qconfig_modules)}")
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -347,6 +373,8 @@ def main() -> None:
         int8_model = prepare_static_int8(
             copy.deepcopy(float_model_cpu), backend=args.quant_backend
         )
+        if args.int8_debug:
+            print_int8_debug(int8_model)
         calibrate_model(int8_model, batch_repeat(batch_cpu, args.calib_iters))
         int8_model = convert_static_int8(int8_model)
 
