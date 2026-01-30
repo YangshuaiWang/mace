@@ -1,6 +1,10 @@
 import argparse
 import numpy as np
 import torch
+
+if hasattr(torch, "serialization"):
+    torch.serialization.add_safe_globals([slice])
+
 from e3nn import o3
 
 from mace.data.atomic_data import AtomicData
