@@ -42,6 +42,7 @@ from .models import (
     EnergyDipolesMACE,
     ScaleShiftMACE,
 )
+from .quantization import IrrepsQuantizer, QuantizationConfig, ScalarQuantizer
 from .radial import BesselBasis, GaussianBasis, PolynomialCutoff, ZBLBasis
 from .symmetric_contraction import SymmetricContraction
 from .utils import (
@@ -118,6 +119,9 @@ __all__ = [
     "WeightedEnergyForcesL1L2Loss",
     "SymmetricContraction",
     "interaction_classes",
+    "QuantizationConfig",
+    "ScalarQuantizer",
+    "IrrepsQuantizer",
     "compute_mean_std_atomic_inter_energy",
     "compute_avg_num_neighbors",
     "compute_statistics",

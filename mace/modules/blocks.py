@@ -12,6 +12,7 @@ import torch.nn.functional
 from e3nn import nn, o3
 from e3nn.util.jit import compile_mode
 
+from mace.modules.quantization import QuantizationConfig, ScalarQuantizer
 from mace.modules.wrapper_ops import (
     CuEquivarianceConfig,
     FullyConnectedTensorProduct,
@@ -468,6 +469,7 @@ class InteractionBlock(torch.nn.Module):
         radial_MLP: Optional[List[int]] = None,
         cueq_config: Optional[CuEquivarianceConfig] = None,
         oeq_config: Optional[OEQConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.node_attrs_irreps = node_attrs_irreps
@@ -485,11 +487,24 @@ class InteractionBlock(torch.nn.Module):
         self.edge_irreps = edge_irreps
         self.cueq_config = cueq_config
         self.oeq_config = oeq_config
+        self.quant_config = quant_config
         if self.oeq_config and self.oeq_config.conv_fusion:
             self.conv_fusion = self.oeq_config.conv_fusion
         if self.cueq_config and self.cueq_config.conv_fusion:
             self.conv_fusion = self.cueq_config.conv_fusion
         self._setup()
+
+    def _init_tp_weight_quantizer(self) -> None:
+        if self.quant_config is None:
+            return
+        self.tp_weight_quantizer = ScalarQuantizer(
+            self.conv_tp.weight_numel, self.quant_config
+        )
+
+    def _quantize_tp_weights(self, tp_weights: torch.Tensor) -> torch.Tensor:
+        if hasattr(self, "tp_weight_quantizer"):
+            return self.tp_weight_quantizer(tp_weights)
+        return tp_weights
 
     @abstractmethod
     def _setup(self) -> None:
@@ -574,6 +589,7 @@ class RealAgnosticInteractionBlock(InteractionBlock):
             [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
             torch.nn.functional.silu,
         )
+        self._init_tp_weight_quantizer()
 
         # Linear
         self.irreps_out = self.target_irreps
@@ -617,6 +633,7 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         tp_weights = self.conv_tp_weights(edge_feats)
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
+        tp_weights = self._quantize_tp_weights(tp_weights)
 
         message = None
         if hasattr(self, "conv_fusion"):
@@ -677,6 +694,7 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
             [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
             torch.nn.functional.silu,  # gate
         )
+        self._init_tp_weight_quantizer()
 
         # Linear
         self.irreps_out = self.target_irreps
@@ -721,6 +739,7 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
         tp_weights = self.conv_tp_weights(edge_feats)
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
+        tp_weights = self._quantize_tp_weights(tp_weights)
         message = None
         if hasattr(self, "conv_fusion"):
             message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
@@ -799,6 +818,8 @@ class RealAgnosticDensityInteractionBlock(InteractionBlock):
             cueq_config=self.cueq_config,
         )
 
+        self._init_tp_weight_quantizer()
+
         # Density normalization
         self.density_fn = nn.FullyConnectedNet(
             [input_dim]
@@ -837,6 +858,7 @@ class RealAgnosticDensityInteractionBlock(InteractionBlock):
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
             edge_density = edge_density * cutoff
+        tp_weights = self._quantize_tp_weights(tp_weights)
         density = scatter_sum(
             src=edge_density, index=receiver, dim=0, dim_size=num_nodes
         )  # [n_nodes, 1]
@@ -920,6 +942,8 @@ class RealAgnosticDensityResidualInteractionBlock(InteractionBlock):
             cueq_config=self.cueq_config,
         )
 
+        self._init_tp_weight_quantizer()
+
         # Density normalization
         self.density_fn = nn.FullyConnectedNet(
             [input_dim]
@@ -960,6 +984,7 @@ class RealAgnosticDensityResidualInteractionBlock(InteractionBlock):
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
             edge_density = edge_density * cutoff
+        tp_weights = self._quantize_tp_weights(tp_weights)
         density = scatter_sum(
             src=edge_density, index=receiver, dim=0, dim_size=num_nodes
         )  # [n_nodes, 1]
@@ -1036,6 +1061,7 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
             [input_dim] + 3 * [256] + [self.conv_tp.weight_numel],
             torch.nn.functional.silu,
         )
+        self._init_tp_weight_quantizer()
 
         # Linear
         self.irreps_out = self.target_irreps
@@ -1081,6 +1107,7 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
             dim=-1,
         )
         tp_weights = self.conv_tp_weights(augmented_edge_feats)
+        tp_weights = self._quantize_tp_weights(tp_weights)
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
         message = None
@@ -1156,6 +1183,7 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
             + self.radial_MLP
             + [self.conv_tp.weight_numel]
         )
+        self._init_tp_weight_quantizer()
         self.irreps_out = self.target_irreps
 
         # Selector TensorProduct
@@ -1268,6 +1296,7 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
         if cutoff is not None:
             tp_weights = tp_weights * cutoff
             edge_density = edge_density * cutoff
+        tp_weights = self._quantize_tp_weights(tp_weights)
         density = scatter_sum(
             src=edge_density, index=edge_index[1], dim=0, dim_size=num_nodes
         )
