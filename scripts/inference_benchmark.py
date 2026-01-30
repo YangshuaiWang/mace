@@ -209,6 +209,13 @@ def print_int8_validation(float_model: torch.nn.Module, int8_model: torch.nn.Mod
             module, (torch.nn.quantized.Linear, torch.nn.quantized.Embedding)
         )
     ]
+    if not quant_modules:
+        print(
+            "WARNING: No torch.nn.quantized Linear/Embedding modules found after "
+            "conversion. INT8 conversion likely no-op; check for custom linear "
+            "layers (e3nn.o3.Linear/cuET) that torch.ao quantization doesn't "
+            "automatically convert."
+        )
     module_types = [type(module).__name__ for module in quant_modules[:5]]
     print(f"INT8 module types (sample): {module_types or 'None found'}")
 
@@ -273,6 +280,19 @@ def print_int8_debug(float_model: torch.nn.Module) -> None:
     for name, module_type, qconfig in qconfig_modules[:20]:
         print(f"  - {name}: {module_type}, qconfig={qconfig}")
     print(f"INT8 debug: total modules with qconfig: {len(qconfig_modules)}")
+
+    equivariant_linears = []
+    for name, module in float_model.named_modules():
+        module_path = f"{module.__module__}.{module.__class__.__name__}"
+        if (
+            module.__class__.__name__ == "Linear"
+            and module_path.startswith(("e3nn.", "cuequivariance_torch."))
+        ):
+            equivariant_linears.append((name, module_path))
+    print("INT8 debug: e3nn/cuET Linear modules (first 20):")
+    for name, module_path in equivariant_linears[:20]:
+        print(f"  - {name}: {module_path}")
+    print(f"INT8 debug: total e3nn/cuET Linear modules: {len(equivariant_linears)}")
 
 
 def main() -> None:
