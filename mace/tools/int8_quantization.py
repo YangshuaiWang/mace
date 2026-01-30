@@ -146,6 +146,28 @@ def _collect_quantized_modules(model: torch.nn.Module) -> Dict[str, torch.nn.Mod
     return quantized
 
 
+def _apply_qconfig(
+    model: torch.nn.Module,
+    qconfig: torch.ao.quantization.QConfig,
+    embedding_qconfig: torch.ao.quantization.QConfig,
+) -> None:
+    for module in model.modules():
+        if isinstance(module, torch.nn.Embedding):
+            module.qconfig = embedding_qconfig
+        elif isinstance(
+            module,
+            (
+                torch.nn.Linear,
+                torch.ao.quantization.QuantStub,
+                torch.ao.quantization.DeQuantStub,
+                QuantizedLinearBlock,
+                QuantizedRadialMLP,
+                QuantizedGenericJointEmbedding,
+            ),
+        ):
+            module.qconfig = qconfig
+
+
 def prepare_static_int8(
     model: torch.nn.Module, backend: str = "fbgemm"
 ) -> torch.nn.Module:
@@ -153,7 +175,7 @@ def prepare_static_int8(
     qconfig = torch.ao.quantization.get_default_qconfig(backend)
     embedding_qconfig = torch.ao.quantization.float_qparams_weight_only_qconfig
     model = replace_quantizable_modules(model, qconfig, embedding_qconfig)
-    model.qconfig = qconfig
+    _apply_qconfig(model, qconfig, embedding_qconfig)
     _disable_fake_quant(model)
     model.eval()
     torch.ao.quantization.prepare(model, inplace=True)
