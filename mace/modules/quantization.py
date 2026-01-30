@@ -83,6 +83,8 @@ def _fake_quantize(
     if not observer.initialized:
         return x
     scale, zero_point = observer.get_qparams(qmin=qmin, qmax=qmax, eps=eps)
+    scale = scale.detach()
+    zero_point = zero_point.detach()
     if per_channel:
         return torch.fake_quantize_per_channel_affine(
             x, scale, zero_point, channel_axis, qmin, qmax
