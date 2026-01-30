@@ -153,6 +153,7 @@ def prepare_static_int8(
     qconfig = torch.ao.quantization.get_default_qconfig(backend)
     embedding_qconfig = torch.ao.quantization.float_qparams_weight_only_qconfig
     model = replace_quantizable_modules(model, qconfig, embedding_qconfig)
+    model.qconfig = qconfig
     _disable_fake_quant(model)
     model.eval()
     torch.ao.quantization.prepare(model, inplace=True)
