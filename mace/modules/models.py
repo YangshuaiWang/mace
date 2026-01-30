@@ -12,6 +12,12 @@ from e3nn import o3
 from e3nn.util.jit import compile_mode
 
 from mace.modules.embeddings import GenericJointEmbedding
+from mace.modules.quantization import (
+    IrrepsQuantizer,
+    QuantizationConfig,
+    ScalarQuantizer,
+    set_quantization_active,
+)
 from mace.modules.radial import ZBLBasis
 from mace.tools.scatter import scatter_mean, scatter_sum
 from mace.tools.torch_tools import get_change_of_basis, spherical_to_cartesian
@@ -79,6 +85,7 @@ class MACE(torch.nn.Module):
         oeq_config: Optional[Dict[str, Any]] = None,
         lammps_mliap: Optional[bool] = False,
         readout_cls: Optional[Type[NonLinearReadoutBlock]] = NonLinearReadoutBlock,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.register_buffer(
@@ -103,6 +110,7 @@ class MACE(torch.nn.Module):
         self.use_so3 = use_so3
         self.use_last_readout_only = use_last_readout_only
         self.use_edge_irreps_first = use_edge_irreps_first
+        self.quant_config = quant_config
 
         # Embedding
         node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
@@ -113,6 +121,7 @@ class MACE(torch.nn.Module):
             cueq_config=cueq_config,
         )
         embedding_size = node_feats_irreps.count(o3.Irrep(0, 1))
+        self.node_embedding_quant = ScalarQuantizer(embedding_size, quant_config)
         if embedding_specs is not None:
             self.embedding_specs = embedding_specs
             self.joint_embedding = GenericJointEmbedding(
@@ -127,6 +136,7 @@ class MACE(torch.nn.Module):
                     cueq_config,
                     oeq_config,
                 )
+                self.embedding_readout_quant = ScalarQuantizer(len(heads), quant_config)
 
         self.radial_embedding = RadialEmbeddingBlock(
             r_max=r_max,
@@ -136,6 +146,7 @@ class MACE(torch.nn.Module):
             distance_transform=distance_transform,
             apply_cutoff=apply_cutoff,
         )
+        self.edge_feat_quant = ScalarQuantizer(self.radial_embedding.out_dim, quant_config)
         edge_feats_irreps = o3.Irreps(f"{self.radial_embedding.out_dim}x0e")
         if pair_repulsion:
             self.pair_repulsion_fn = ZBLBasis(p=num_polynomial_cutoff)
@@ -184,6 +195,7 @@ class MACE(torch.nn.Module):
             radial_MLP=radial_MLP,
             cueq_config=cueq_config,
             oeq_config=oeq_config,
+            quant_config=quant_config,
         )
         self.interactions = torch.nn.ModuleList([inter])
 
@@ -205,6 +217,9 @@ class MACE(torch.nn.Module):
             use_agnostic_product=use_agnostic_product,
         )
         self.products = torch.nn.ModuleList([prod])
+        self.node_feat_quantizers = torch.nn.ModuleList(
+            [IrrepsQuantizer(hidden_irreps_out, quant_config)]
+        )
 
         self.readouts = torch.nn.ModuleList()
         if not use_last_readout_only:
@@ -215,6 +230,11 @@ class MACE(torch.nn.Module):
                     cueq_config,
                     oeq_config,
                 )
+            )
+        self.readout_quants = torch.nn.ModuleList()
+        if not use_last_readout_only:
+            self.readout_quants.append(
+                ScalarQuantizer(len(heads), quant_config)
             )
 
         for i in range(num_interactions - 1):
@@ -236,6 +256,7 @@ class MACE(torch.nn.Module):
                 radial_MLP=radial_MLP,
                 cueq_config=cueq_config,
                 oeq_config=oeq_config,
+                quant_config=quant_config,
             )
             self.interactions.append(inter)
             prod = EquivariantProductBasisBlock(
@@ -250,6 +271,9 @@ class MACE(torch.nn.Module):
                 use_agnostic_product=use_agnostic_product,
             )
             self.products.append(prod)
+            self.node_feat_quantizers.append(
+                IrrepsQuantizer(hidden_irreps_out, quant_config)
+            )
             if i == num_interactions - 2:
                 self.readouts.append(
                     readout_cls(
@@ -262,6 +286,7 @@ class MACE(torch.nn.Module):
                         oeq_config,
                     )
                 )
+                self.readout_quants.append(ScalarQuantizer(len(heads), quant_config))
             elif not use_last_readout_only:
                 self.readouts.append(
                     LinearReadoutBlock(
@@ -271,6 +296,10 @@ class MACE(torch.nn.Module):
                         oeq_config,
                     )
                 )
+                self.readout_quants.append(ScalarQuantizer(len(heads), quant_config))
+
+    def set_quantization(self, enabled: bool) -> None:
+        set_quantization_active(self, enabled)
 
     def forward(
         self,
@@ -321,6 +350,7 @@ class MACE(torch.nn.Module):
         edge_feats, cutoff = self.radial_embedding(
             lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
         )
+        edge_feats = self.edge_feat_quant(edge_feats)
         if hasattr(self, "pair_repulsion"):
             pair_node_energy = self.pair_repulsion_fn(
                 lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
@@ -343,9 +373,11 @@ class MACE(torch.nn.Module):
                 embedding_features,
             )
             if hasattr(self, "embedding_readout"):
-                embedding_node_energy = self.embedding_readout(
-                    node_feats, node_heads
-                ).squeeze(-1)
+                embedding_node_energy = self.embedding_readout(node_feats, node_heads)
+                embedding_node_energy = self.embedding_readout_quant(
+                    embedding_node_energy
+                )
+                embedding_node_energy = embedding_node_energy.squeeze(-1)
                 embedding_energy = scatter_sum(
                     src=embedding_node_energy,
                     index=data["batch"],
@@ -353,6 +385,7 @@ class MACE(torch.nn.Module):
                     dim_size=num_graphs,
                 )
                 e0 += embedding_energy
+        node_feats = self.node_embedding_quant(node_feats)
 
         # Interactions
         energies = [e0, pair_energy]
@@ -381,13 +414,14 @@ class MACE(torch.nn.Module):
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
+            node_feats = self.node_feat_quantizers[i](node_feats)
             node_feats_concat.append(node_feats)
 
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
-            node_es = readout(node_feats_concat[feat_idx], node_heads)[
-                num_atoms_arange, node_heads
-            ]
+            node_es_full = readout(node_feats_concat[feat_idx], node_heads)
+            node_es_full = self.readout_quants[i](node_es_full)
+            node_es = node_es_full[num_atoms_arange, node_heads]
             energy = scatter_sum(node_es, data["batch"], dim=0, dim_size=num_graphs)
             energies.append(energy)
             node_energies_list.append(node_es)
@@ -512,6 +546,8 @@ class ScaleShiftMACE(MACE):
         else:
             pair_node_energy = torch.zeros_like(node_e0)
 
+        edge_feats = self.edge_feat_quant(edge_feats)
+
         # Embeddings of additional features
         if hasattr(self, "joint_embedding"):
             embedding_features: Dict[str, torch.Tensor] = {}
@@ -522,10 +558,12 @@ class ScaleShiftMACE(MACE):
                 embedding_features,
             )
             if hasattr(self, "embedding_readout"):
+                embedding_node_energy = self.embedding_readout(node_feats, node_heads)
+                embedding_node_energy = self.embedding_readout_quant(
+                    embedding_node_energy
+                )
                 embedding_node_energy = torch.atleast_1d(
-                    self.embedding_readout(node_feats, node_heads)[
-                        num_atoms_arange, node_heads
-                    ].squeeze(-1)
+                    embedding_node_energy[num_atoms_arange, node_heads].squeeze(-1)
                 )
                 embedding_energy = scatter_sum(
                     src=embedding_node_energy,
@@ -534,6 +572,7 @@ class ScaleShiftMACE(MACE):
                     dim_size=num_graphs,
                 )
                 e0 += embedding_energy
+        node_feats = self.node_embedding_quant(node_feats)
 
         # Interactions
         node_es_list = [pair_node_energy]
@@ -561,15 +600,14 @@ class ScaleShiftMACE(MACE):
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
+            node_feats = self.node_feat_quantizers[i](node_feats)
             node_feats_list.append(node_feats)
 
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
-            node_es_list.append(
-                readout(node_feats_list[feat_idx], node_heads)[
-                    num_atoms_arange, node_heads
-                ]
-            )
+            node_es_full = readout(node_feats_list[feat_idx], node_heads)
+            node_es_full = self.readout_quants[i](node_es_full)
+            node_es_list.append(node_es_full[num_atoms_arange, node_heads])
 
         node_feats_out = torch.cat(node_feats_list, dim=-1)
         node_inter_es = torch.sum(torch.stack(node_es_list, dim=0), dim=0)
