@@ -31,6 +31,18 @@ def parse_args() -> argparse.Namespace:
         help="Set torch intra-op threads (CPU only).",
     )
     parser.add_argument("--fullgraph", action="store_true")
+    parser.add_argument(
+        "--compare-quant",
+        action="store_true",
+        help="Run FP32 vs INT8 quantized comparison (CPU only).",
+    )
+    parser.add_argument(
+        "--quant-backend",
+        type=str,
+        default="fbgemm",
+        choices=("fbgemm", "qnnpack"),
+        help="Quantized backend to use when --compare-quant is set.",
+    )
     return parser.parse_args()
 
 
@@ -128,12 +140,57 @@ def summarize(latencies: List[float]) -> Tuple[float, float]:
     return statistics.mean(latencies), statistics.stdev(latencies)
 
 
+def quantize_model(model: torch.nn.Module) -> torch.nn.Module:
+    model.eval()
+    return torch.ao.quantization.quantize_dynamic(
+        model, {torch.nn.Linear}, dtype=torch.qint8
+    )
+
+
+def print_benchmark_summary(
+    title: str,
+    args: argparse.Namespace,
+    device: torch.device,
+    batch: dict,
+    mean_latency: float,
+    std_latency: float,
+    quantized: bool = False,
+) -> None:
+    num_atoms = int(batch["positions"].shape[0])
+    num_edges = int(batch["edge_index"].shape[1])
+    steps_per_day = 86400 / mean_latency if mean_latency > 0 else float("inf")
+    ns_per_day = 0.0864 / mean_latency if mean_latency > 0 else float("inf")
+
+    print(title)
+    dtype_label = "int8 (dynamic)" if quantized else args.dtype
+    print(f"Model: {args.model}")
+    print(f"Device: {device}")
+    print(f"Dtype: {dtype_label}")
+    print(f"Compile mode: {None if args.compile_mode == 'none' else args.compile_mode}")
+    print(f"Fullgraph: {args.fullgraph}")
+    if args.threads is not None and device.type == "cpu":
+        print(f"CPU threads: {torch.get_num_threads()}")
+    if quantized:
+        print(f"Quantized backend: {torch.backends.quantized.engine}")
+    print(f"Num atoms: {num_atoms}")
+    print(f"Num edges: {num_edges}")
+    print(f"Iters per repeat: {args.iters}")
+    print(f"Repeats: {args.repeats}")
+    print(f"Compute forces: {args.compute_force}")
+    print(f"Avg latency: {mean_latency * 1e3:.3f} ms ± {std_latency * 1e3:.3f} ms")
+    print(f"Steps per day: {steps_per_day:.0f}")
+    print(f"ns/day (1 fs/step): {ns_per_day:.2f}")
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     device = torch.device(args.device)
+    if args.compare_quant and device.type != "cpu":
+        print("WARNING: --compare-quant is CPU-only; switching device to CPU.")
+        device = torch.device("cpu")
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA device requested but not available")
 
@@ -141,6 +198,8 @@ def main() -> None:
         torch.set_num_threads(args.threads)
 
     compile_mode = None if args.compile_mode == "none" else args.compile_mode
+
+    torch.backends.quantized.engine = args.quant_backend
 
     with torch_tools.default_dtype(args.dtype):
         model = load_model(
@@ -163,27 +222,43 @@ def main() -> None:
         )
 
     mean_latency, std_latency = summarize(latencies)
-    num_atoms = int(batch["positions"].shape[0])
-    num_edges = int(batch["edge_index"].shape[1])
-    steps_per_day = 86400 / mean_latency if mean_latency > 0 else float("inf")
-    ns_per_day = 0.0864 / mean_latency if mean_latency > 0 else float("inf")
+    print_benchmark_summary(
+        "== MACE Inference Benchmark (FP32) ==",
+        args,
+        device,
+        batch,
+        mean_latency,
+        std_latency,
+    )
 
-    print("== MACE Inference Benchmark ==")
-    print(f"Model: {args.model}")
-    print(f"Device: {device}")
-    print(f"Dtype: {args.dtype}")
-    print(f"Compile mode: {compile_mode}")
-    print(f"Fullgraph: {args.fullgraph}")
-    if args.threads is not None and device.type == "cpu":
-        print(f"CPU threads: {torch.get_num_threads()}")
-    print(f"Num atoms: {num_atoms}")
-    print(f"Num edges: {num_edges}")
-    print(f"Iters per repeat: {args.iters}")
-    print(f"Repeats: {args.repeats}")
-    print(f"Compute forces: {args.compute_force}")
-    print(f"Avg latency: {mean_latency * 1e3:.3f} ms ± {std_latency * 1e3:.3f} ms")
-    print(f"Steps per day: {steps_per_day:.0f}")
-    print(f"ns/day (1 fs/step): {ns_per_day:.2f}")
+    if args.compare_quant:
+        if device.type != "cpu":
+            raise RuntimeError("--compare-quant requires CPU execution")
+        if args.dtype != "float32":
+            print("WARNING: quantization expects float32 weights; using float32.")
+        quant_model = quantize_model(model)
+        quant_latencies = run_benchmark(
+            quant_model,
+            batch,
+            compute_force=args.compute_force,
+            training=False,
+            warmup=args.warmup,
+            iters=args.iters,
+            repeats=args.repeats,
+            device=device,
+        )
+        quant_mean, quant_std = summarize(quant_latencies)
+        print_benchmark_summary(
+            "== MACE Inference Benchmark (INT8) ==",
+            args,
+            device,
+            batch,
+            quant_mean,
+            quant_std,
+            quantized=True,
+        )
+        speedup = mean_latency / quant_mean if quant_mean > 0 else float("inf")
+        print(f"Speedup (FP32/INT8): {speedup:.2f}x")
 
 
 if __name__ == "__main__":
