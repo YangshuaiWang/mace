@@ -1,6 +1,7 @@
 import argparse
 import json
 import pathlib
+import time
 from typing import Dict, List
 
 import numpy as np
@@ -12,10 +13,7 @@ if hasattr(torch, "serialization"):
 from e3nn import o3
 
 from mace.data.atomic_data import AtomicData
-from mace.modules.blocks import (
-    RealAgnosticInteractionBlock,
-    RealAgnosticResidualInteractionBlock,
-)
+from mace.modules.blocks import RealAgnosticResidualNonLinearInteractionBlock
 from mace.modules.models import MACE
 from mace.tools.int8_quantization import (
     TORCHAO_AVAILABLE,
@@ -81,9 +79,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-torchao", action="store_true")
     parser.add_argument("--out-path", type=pathlib.Path, default=pathlib.Path("mace_int8.pt"))
     parser.add_argument(
+        "--fp32-out-path", type=pathlib.Path, default=pathlib.Path("mace_fp32.pt")
+    )
+    parser.add_argument(
         "--report-path", type=pathlib.Path, default=pathlib.Path("mace_int8_report.json")
     )
     parser.add_argument("--calibration-iters", type=int, default=8)
+    parser.add_argument("--bench-warmup-iters", type=int, default=10)
+    parser.add_argument("--bench-iters", type=int, default=50)
     return parser.parse_args()
 
 
@@ -106,6 +109,23 @@ def model_has_int8_weights(model: torch.nn.Module) -> bool:
     return False
 
 
+def timed_forward(
+    model: torch.nn.Module,
+    batch: Dict[str, torch.Tensor],
+    warmup_iters: int,
+    bench_iters: int,
+) -> float:
+    model.eval()
+    with torch.no_grad():
+        for _ in range(warmup_iters):
+            _ = model(batch, compute_force=False)
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            _ = model(batch, compute_force=False)
+        end = time.perf_counter()
+    return (end - start) / max(bench_iters, 1)
+
+
 def main() -> None:
     args = parse_args()
     if args.use_torchao and not TORCHAO_AVAILABLE:
@@ -119,8 +139,8 @@ def main() -> None:
         num_bessel=4,
         num_polynomial_cutoff=3,
         max_ell=2,
-        interaction_cls=RealAgnosticResidualInteractionBlock,
-        interaction_cls_first=RealAgnosticInteractionBlock,
+        interaction_cls=RealAgnosticResidualNonLinearInteractionBlock,
+        interaction_cls_first=RealAgnosticResidualNonLinearInteractionBlock,
         num_interactions=2,
         num_elements=1,
         hidden_irreps=o3.Irreps("8x0e + 8x1o"),
@@ -150,6 +170,13 @@ def main() -> None:
         use_torchao=args.use_torchao,
     )
     print(json.dumps(report, indent=2))
+    torch.save(model.state_dict(), args.fp32_out_path)
+    fp32_bytes = args.fp32_out_path.stat().st_size
+    int8_bytes = args.out_path.stat().st_size
+    print(f"FP32 state dict size: {fp32_bytes / 1e6:.2f} MB")
+    print(f"INT8 state dict size: {int8_bytes / 1e6:.2f} MB")
+    if fp32_bytes > 0:
+        print(f"State dict compression: {fp32_bytes / int8_bytes:.2f}x")
 
     quantized_model, _ = build_int8_model(
         model=model,
@@ -166,6 +193,22 @@ def main() -> None:
     print(f"State dict contains INT8 weights: {has_int8}")
 
     batch = build_batch(positions, num_elements=1)
+    fp_time = timed_forward(
+        model,
+        batch,
+        warmup_iters=args.bench_warmup_iters,
+        bench_iters=args.bench_iters,
+    )
+    int8_time = timed_forward(
+        quantized_model,
+        batch,
+        warmup_iters=args.bench_warmup_iters,
+        bench_iters=args.bench_iters,
+    )
+    print(f"FP32 avg latency: {fp_time * 1e3:.3f} ms")
+    print(f"INT8 avg latency: {int8_time * 1e3:.3f} ms")
+    if int8_time > 0:
+        print(f"Speedup (fp32/int8): {fp_time / int8_time:.2f}x")
     with torch.no_grad():
         output_quant = quantized_model(batch, compute_force=False)
     print(f"Quantized energy: {output_quant['energy'].detach().cpu().numpy()}")

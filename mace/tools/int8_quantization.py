@@ -48,6 +48,7 @@ class QuantizedLinearBlock(torch.nn.Module):
         self.linear = linear
         self.dequant = torch.ao.quantization.DeQuantStub()
         self.qconfig = qconfig
+        self.linear.qconfig = qconfig
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.quant(x)
