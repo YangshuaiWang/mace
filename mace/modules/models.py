@@ -307,6 +307,12 @@ class MACE(torch.nn.Module):
             return edge_feats
         return edge_quant(edge_feats)
 
+    def _quantize_node_feats(self, node_feats: torch.Tensor) -> torch.Tensor:
+        node_quant = getattr(self, "node_embedding_quant", None)
+        if node_quant is None:
+            return node_feats
+        return node_quant(node_feats)
+
     def forward(
         self,
         data: Dict[str, torch.Tensor],
@@ -391,7 +397,7 @@ class MACE(torch.nn.Module):
                     dim_size=num_graphs,
                 )
                 e0 += embedding_energy
-        node_feats = self.node_embedding_quant(node_feats)
+        node_feats = self._quantize_node_feats(node_feats)
 
         # Interactions
         energies = [e0, pair_energy]
@@ -578,7 +584,7 @@ class ScaleShiftMACE(MACE):
                     dim_size=num_graphs,
                 )
                 e0 += embedding_energy
-        node_feats = self.node_embedding_quant(node_feats)
+        node_feats = self._quantize_node_feats(node_feats)
 
         # Interactions
         node_es_list = [pair_node_energy]
