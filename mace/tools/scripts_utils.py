@@ -853,6 +853,15 @@ def get_optimizer(
 ) -> torch.optim.Optimizer:
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(**param_options)
+    elif args.optimizer == "muon":
+        _param_options = {
+            k: v for k, v in param_options.items() if k not in {"amsgrad", "betas"}
+        }
+        optimizer = torch.optim.Muon(
+            **_param_options,
+            momentum=args.beta,
+            nesterov=True,
+        )
     elif args.optimizer == "schedulefree":
         try:
             from schedulefree import adamw_schedulefree
