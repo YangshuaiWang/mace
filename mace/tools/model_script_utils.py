@@ -117,6 +117,9 @@ def configure_model(
             "FoundationMACELES" if args.model == "MACELES" else "FoundationMACE"
         )
         model_config_foundation["heads"] = heads
+        model_config_foundation["ib_uq_enabled"] = args.ib_uq
+        model_config_foundation["ib_uq_latent_dim"] = args.ib_uq_dz
+        model_config_foundation["ib_uq_deterministic"] = args.ib_uq_deterministic
         model_config = model_config_foundation
 
         logging.info("Model configuration extracted from foundation model")
@@ -244,6 +247,9 @@ def _build_model(
             use_embedding_readout=args.use_embedding_readout,
             use_last_readout_only=args.use_last_readout_only,
             use_agnostic_product=args.use_agnostic_product,
+            ib_uq_enabled=args.ib_uq,
+            ib_uq_latent_dim=args.ib_uq_dz,
+            ib_uq_deterministic=args.ib_uq_deterministic,
         )
     if args.model == "ScaleShiftMACE":
         return modules.ScaleShiftMACE(
@@ -263,6 +269,9 @@ def _build_model(
             use_embedding_readout=args.use_embedding_readout,
             use_last_readout_only=args.use_last_readout_only,
             use_agnostic_product=args.use_agnostic_product,
+            ib_uq_enabled=args.ib_uq,
+            ib_uq_latent_dim=args.ib_uq_dz,
+            ib_uq_deterministic=args.ib_uq_deterministic,
         )
     if args.model == "FoundationMACE":
         return modules.ScaleShiftMACE(**model_config_foundation)
@@ -351,5 +360,8 @@ def _build_model(
             use_embedding_readout=args.use_embedding_readout,
             use_last_readout_only=args.use_last_readout_only,
             use_agnostic_product=args.use_agnostic_product,
+            ib_uq_enabled=args.ib_uq,
+            ib_uq_latent_dim=args.ib_uq_dz,
+            ib_uq_deterministic=args.ib_uq_deterministic,
         )
     raise RuntimeError(f"Unknown model: '{args.model}'")
