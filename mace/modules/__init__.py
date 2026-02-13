@@ -1,3 +1,4 @@
+from .confidence_gate import ConfidenceGate
 from typing import Callable, Dict, Optional, Type
 
 import torch
@@ -128,4 +129,5 @@ __all__ = [
     "compute_fixed_charge_dipole",
     "compute_fixed_charge_dipole_polar",
     "compute_dielectric_gradients",
+    "ConfidenceGate",
 ]

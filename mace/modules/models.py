@@ -36,6 +36,7 @@ from .blocks import (
     RadialEmbeddingBlock,
     ScaleShiftBlock,
 )
+from .confidence_gate import ConfidenceGate
 from .utils import (
     compute_dielectric_gradients,
     compute_fixed_charge_dipole,
@@ -86,6 +87,12 @@ class MACE(torch.nn.Module):
         lammps_mliap: Optional[bool] = False,
         readout_cls: Optional[Type[NonLinearReadoutBlock]] = NonLinearReadoutBlock,
         quant_config: Optional[QuantizationConfig] = None,
+        ib_uq_enabled: bool = False,
+        ib_uq_latent_dim: int = 16,
+        ib_uq_gate_hidden_dim: int = 128,
+        ib_uq_deterministic: bool = False,
+        ib_uq_deterministic_seed: Optional[int] = None,
+        ib_uq_deterministic_zero_z0: bool = True,
     ):
         super().__init__()
         self.register_buffer(
@@ -111,6 +118,10 @@ class MACE(torch.nn.Module):
         self.use_last_readout_only = use_last_readout_only
         self.use_edge_irreps_first = use_edge_irreps_first
         self.quant_config = quant_config
+        self.ib_uq_enabled = ib_uq_enabled
+        self.ib_uq_deterministic = ib_uq_deterministic
+        self.ib_uq_deterministic_seed = ib_uq_deterministic_seed
+        self.ib_uq_deterministic_zero_z0 = ib_uq_deterministic_zero_z0
 
         # Embedding
         node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
@@ -298,6 +309,33 @@ class MACE(torch.nn.Module):
                 )
                 self.readout_quants.append(ScalarQuantizer(len(heads), quant_config))
 
+        self.confidence_gates = torch.nn.ModuleList()
+        self.scalar_injectors = torch.nn.ModuleList()
+        self.scalar_slices = []
+        if self.ib_uq_enabled:
+            for readout in self.readouts:
+                readout_irreps = self._get_readout_input_irreps(readout)
+                scalar_ranges, d0 = self._get_scalar_ranges(readout_irreps)
+                if d0 <= 0:
+                    raise ValueError(
+                        "IB-UQ requires readout inputs with at least one L=0 scalar channel."
+                    )
+                self.scalar_slices.append(scalar_ranges)
+                self.confidence_gates.append(
+                    ConfidenceGate(
+                        d0=d0,
+                        dz=ib_uq_latent_dim,
+                        hidden=ib_uq_gate_hidden_dim,
+                    )
+                )
+                self.scalar_injectors.append(
+                    torch.nn.Sequential(
+                        torch.nn.Linear(d0 + ib_uq_latent_dim, d0),
+                        torch.nn.SiLU(),
+                        torch.nn.Linear(d0, d0),
+                    )
+                )
+
     def set_quantization(self, enabled: bool) -> None:
         set_quantization_active(self, enabled)
 
@@ -312,6 +350,78 @@ class MACE(torch.nn.Module):
         if node_quant is None:
             return node_feats
         return node_quant(node_feats)
+
+    @staticmethod
+    def _get_readout_input_irreps(readout: torch.nn.Module) -> o3.Irreps:
+        if isinstance(readout, LinearReadoutBlock):
+            return readout.linear.irreps_in
+        if isinstance(readout, NonLinearReadoutBlock):
+            return readout.linear_1.irreps_in
+        raise TypeError(f"Unsupported readout block type for IB-UQ: {type(readout)}")
+
+    @staticmethod
+    def _get_scalar_ranges(irreps: o3.Irreps) -> tuple[List[List[int]], int]:
+        scalar_ranges: List[List[int]] = []
+        scalar_dim = 0
+        for mul_ir, sl in zip(irreps, irreps.slices()):
+            mul, ir = mul_ir
+            if ir.l == 0:
+                scalar_ranges.append([sl.start, sl.stop])
+                scalar_dim += mul
+        return scalar_ranges, scalar_dim
+
+    @staticmethod
+    def _extract_h0(node_feats: torch.Tensor, scalar_ranges: List[List[int]]) -> torch.Tensor:
+        h0_parts = [node_feats[:, start:stop] for start, stop in scalar_ranges]
+        return torch.cat(h0_parts, dim=-1)
+
+    @staticmethod
+    def _replace_h0(
+        node_feats: torch.Tensor,
+        h0_aug: torch.Tensor,
+        scalar_ranges: List[List[int]],
+    ) -> torch.Tensor:
+        node_feats_aug = node_feats.clone()
+        offset = 0
+        for start, stop in scalar_ranges:
+            width = stop - start
+            node_feats_aug[:, start:stop] = h0_aug[:, offset : offset + width]
+            offset += width
+        return node_feats_aug
+
+    def _sample_z0(self, shape: torch.Size, ref: torch.Tensor) -> torch.Tensor:
+        if self.ib_uq_deterministic and self.ib_uq_deterministic_zero_z0:
+            return torch.zeros(shape, device=ref.device, dtype=ref.dtype)
+        if self.ib_uq_deterministic and self.ib_uq_deterministic_seed is not None:
+            generator = torch.Generator(device=ref.device)
+            generator.manual_seed(self.ib_uq_deterministic_seed)
+            return torch.randn(shape, generator=generator, device=ref.device, dtype=ref.dtype)
+        return torch.randn(shape, device=ref.device, dtype=ref.dtype)
+
+    def _apply_confidence_gate(
+        self,
+        node_feats: torch.Tensor,
+        readout_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        scalar_ranges = self.scalar_slices[readout_index]
+        h0 = self._extract_h0(node_feats, scalar_ranges)
+        m, z_bar = self.confidence_gates[readout_index](h0)
+        z0 = self._sample_z0(z_bar.shape, z_bar)
+        z = m * z_bar + (1.0 - m) * z0
+        h0_aug = self.scalar_injectors[readout_index](torch.cat([h0, z], dim=-1))
+        node_feats_aug = self._replace_h0(node_feats, h0_aug, scalar_ranges)
+
+        # Runtime safety check: IB-UQ latent is injected into invariant (L=0) channels only.
+        scalar_mask = torch.zeros(
+            node_feats.shape[-1], device=node_feats.device, dtype=torch.bool
+        )
+        for start, stop in scalar_ranges:
+            scalar_mask[start:stop] = True
+        assert torch.equal(
+            node_feats_aug[:, ~scalar_mask], node_feats[:, ~scalar_mask]
+        ), "IB-UQ must never modify L>0 equivariant channels."
+
+        return node_feats_aug, m
 
     def forward(
         self,
@@ -431,9 +541,28 @@ class MACE(torch.nn.Module):
                 node_feats = node_feat_quantizers[i](node_feats)
             node_feats_concat.append(node_feats)
 
+        gate_means: List[torch.Tensor] = []
+        gate_mins: List[torch.Tensor] = []
+        gate_scores: List[torch.Tensor] = []
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
-            node_es_full = readout(node_feats_concat[feat_idx], node_heads)
+            node_feats_for_readout = node_feats_concat[feat_idx]
+            if self.ib_uq_enabled and not torch.jit.is_scripting():
+                node_feats_for_readout, m = self._apply_confidence_gate(
+                    node_feats_for_readout, i
+                )
+                m_atom_mean = m.mean(dim=-1)
+                m_mean_graph = scatter_mean(
+                    m_atom_mean, data["batch"], dim=0, dim_size=num_graphs
+                )
+                m_min_graph = scatter_mean(
+                    m.min(dim=-1).values, data["batch"], dim=0, dim_size=num_graphs
+                )
+                gate_means.append(m_mean_graph)
+                gate_mins.append(m_min_graph)
+                gate_scores.append(1.0 - m_mean_graph)
+
+            node_es_full = readout(node_feats_for_readout, node_heads)
             readout_quants = getattr(self, "readout_quants", None)
             if readout_quants is not None:
                 node_es_full = readout_quants[i](node_es_full)
@@ -472,7 +601,7 @@ class MACE(torch.nn.Module):
                 batch=data["batch"],
                 cell=cell,
             )
-        return {
+        output = {
             "energy": total_energy,
             "node_energy": node_energy,
             "contributions": contributions,
@@ -486,6 +615,13 @@ class MACE(torch.nn.Module):
             "hessian": hessian,
             "node_feats": node_feats_out,
         }
+        if self.ib_uq_enabled and (not torch.jit.is_scripting()) and len(gate_scores) > 0:
+            output["ib_uq"] = {
+                "gate_score": torch.stack(gate_scores, dim=0).mean(dim=0),
+                "m_mean": torch.stack(gate_means, dim=0).mean(dim=0),
+                "m_min": torch.stack(gate_mins, dim=0).mean(dim=0),
+            }
+        return output
 
 
 @compile_mode("script")
@@ -621,9 +757,28 @@ class ScaleShiftMACE(MACE):
                 node_feats = node_feat_quantizers[i](node_feats)
             node_feats_list.append(node_feats)
 
+        gate_means: List[torch.Tensor] = []
+        gate_mins: List[torch.Tensor] = []
+        gate_scores: List[torch.Tensor] = []
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
-            node_es_full = readout(node_feats_list[feat_idx], node_heads)
+            node_feats_for_readout = node_feats_list[feat_idx]
+            if self.ib_uq_enabled and not torch.jit.is_scripting():
+                node_feats_for_readout, m = self._apply_confidence_gate(
+                    node_feats_for_readout, i
+                )
+                m_atom_mean = m.mean(dim=-1)
+                m_mean_graph = scatter_mean(
+                    m_atom_mean, data["batch"], dim=0, dim_size=num_graphs
+                )
+                m_min_graph = scatter_mean(
+                    m.min(dim=-1).values, data["batch"], dim=0, dim_size=num_graphs
+                )
+                gate_means.append(m_mean_graph)
+                gate_mins.append(m_min_graph)
+                gate_scores.append(1.0 - m_mean_graph)
+
+            node_es_full = readout(node_feats_for_readout, node_heads)
             readout_quants = getattr(self, "readout_quants", None)
             if readout_quants is not None:
                 node_es_full = readout_quants[i](node_es_full)
@@ -662,7 +817,7 @@ class ScaleShiftMACE(MACE):
                 batch=data["batch"],
                 cell=cell,
             )
-        return {
+        output = {
             "energy": total_energy,
             "node_energy": node_energy,
             "interaction_energy": inter_e,
@@ -676,6 +831,13 @@ class ScaleShiftMACE(MACE):
             "displacement": displacement,
             "node_feats": node_feats_out,
         }
+        if self.ib_uq_enabled and (not torch.jit.is_scripting()) and len(gate_scores) > 0:
+            output["ib_uq"] = {
+                "gate_score": torch.stack(gate_scores, dim=0).mean(dim=0),
+                "m_mean": torch.stack(gate_means, dim=0).mean(dim=0),
+                "m_min": torch.stack(gate_mins, dim=0).mean(dim=0),
+            }
+        return output
 
 
 @compile_mode("script")
