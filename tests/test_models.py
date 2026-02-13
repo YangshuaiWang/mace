@@ -128,6 +128,68 @@ def test_mace():
     assert torch.allclose(output2["energy"][0], output2["energy"][1])
 
 
+
+def test_mace_ib_uq_gate_and_deterministic():
+    model_config = dict(
+        r_max=5,
+        num_bessel=8,
+        num_polynomial_cutoff=6,
+        max_ell=2,
+        interaction_cls=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        interaction_cls_first=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        num_interactions=3,
+        num_elements=2,
+        hidden_irreps=o3.Irreps("16x0e + 16x1o"),
+        MLP_irreps=o3.Irreps("16x0e"),
+        gate=torch.nn.functional.silu,
+        atomic_energies=atomic_energies,
+        avg_num_neighbors=8,
+        atomic_numbers=table.zs,
+        correlation=3,
+        radial_type="bessel",
+        ib_uq_enabled=True,
+        ib_uq_latent_dim=8,
+        ib_uq_deterministic=True,
+        ib_uq_deterministic_zero_z0=True,
+    )
+    model = modules.MACE(**model_config)
+
+    atomic_data = data.AtomicData.from_config(config, z_table=table, cutoff=3.0)
+    atomic_data2 = data.AtomicData.from_config(
+        config_rotated, z_table=table, cutoff=3.0
+    )
+
+    data_loader = torch_geometric.dataloader.DataLoader(
+        dataset=[atomic_data, atomic_data2],
+        batch_size=2,
+        shuffle=False,
+        drop_last=False,
+    )
+    batch = next(iter(data_loader)).to_dict()
+
+    output1 = model(batch, training=False)
+    output2 = model(batch, training=False)
+
+    assert output1["energy"].shape[0] == 2
+    assert output1["forces"].shape[-1] == 3
+    assert "ib_uq" in output1
+
+    gate_score = output1["ib_uq"]["gate_score"]
+    m_mean = output1["ib_uq"]["m_mean"]
+    m_min = output1["ib_uq"]["m_min"]
+
+    assert gate_score.shape[0] == 2
+    assert torch.all((gate_score >= 0.0) & (gate_score <= 1.0))
+    assert torch.all((m_mean >= 0.0) & (m_mean <= 1.0))
+    assert torch.all((m_min >= 0.0) & (m_min <= 1.0))
+
+    assert torch.allclose(output1["energy"], output2["energy"])
+    assert torch.allclose(output1["forces"], output2["forces"])
+
 def test_dipole_mace():
     # create dipole MACE model
     model_config = dict(
