@@ -878,6 +878,9 @@ def run(args) -> None:
         plotter=plotter,
         train_sampler=train_sampler,
         rank=rank,
+        ib_uq_lambda=args.ib_uq_lambda,
+        ib_uq_wide_aug=args.ib_uq_wide_aug,
+        ib_uq_wide_frac=args.ib_uq_wide_frac,
     )
 
     logging.info("")

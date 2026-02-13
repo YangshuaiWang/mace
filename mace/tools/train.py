@@ -23,6 +23,7 @@ from torch_ema import ExponentialMovingAverage
 from torchmetrics import Metric
 
 from mace.cli.visualise_train import TrainingPlotter
+from mace.data.wide_augment import build_wide_batch
 
 from . import torch_geometric
 from .checkpoint import CheckpointHandler, CheckpointState
@@ -172,6 +173,9 @@ def train(
     distributed_model: Optional[DistributedDataParallel] = None,
     train_sampler: Optional[DistributedSampler] = None,
     rank: Optional[int] = 0,
+    ib_uq_lambda: float = 0.0,
+    ib_uq_wide_aug: str = "none",
+    ib_uq_wide_frac: float = 1.0,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -243,6 +247,10 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            log_wandb=log_wandb,
+            ib_uq_lambda=ib_uq_lambda,
+            ib_uq_wide_aug=ib_uq_wide_aug,
+            ib_uq_wide_frac=ib_uq_wide_frac,
         )
         if distributed:
             torch.distributed.barrier()
@@ -361,8 +369,15 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
+    log_wandb: bool = False,
+    ib_uq_lambda: float = 0.0,
+    ib_uq_wide_aug: str = "none",
+    ib_uq_wide_frac: float = 1.0,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
+
+    if log_wandb:
+        import wandb
 
     if isinstance(optimizer, LBFGS):
         _, opt_metrics = take_step_lbfgs(
@@ -381,6 +396,8 @@ def train_one_epoch(
         opt_metrics["epoch"] = epoch
         if rank == 0:
             logger.log(opt_metrics)
+            if log_wandb:
+                wandb.log(opt_metrics)
     else:
         for batch in data_loader:
             _, opt_metrics = take_step(
@@ -392,11 +409,16 @@ def train_one_epoch(
                 output_args=output_args,
                 max_grad_norm=max_grad_norm,
                 device=device,
+                ib_uq_lambda=ib_uq_lambda,
+                ib_uq_wide_aug=ib_uq_wide_aug,
+                ib_uq_wide_frac=ib_uq_wide_frac,
             )
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
             if rank == 0:
                 logger.log(opt_metrics)
+                if log_wandb:
+                    wandb.log(opt_metrics)
 
 
 def take_step(
@@ -408,12 +430,20 @@ def take_step(
     output_args: Dict[str, bool],
     max_grad_norm: Optional[float],
     device: torch.device,
+    ib_uq_lambda: float = 0.0,
+    ib_uq_wide_aug: str = "none",
+    ib_uq_wide_frac: float = 1.0,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
     batch_dict = batch.to_dict()
 
+    gate_score_id = None
+    gate_score_wide = None
+    l_gate = torch.tensor(0.0, device=device)
+
     def closure():
+        nonlocal gate_score_id, gate_score_wide, l_gate
         optimizer.zero_grad(set_to_none=True)
         output = model(
             batch_dict,
@@ -422,7 +452,33 @@ def take_step(
             compute_virials=output_args["virials"],
             compute_stress=output_args["stress"],
         )
-        loss = loss_fn(pred=output, ref=batch)
+        loss_sup = loss_fn(pred=output, ref=batch)
+
+        if "ib_uq" in output and "gate_score" in output["ib_uq"]:
+            gate_score_id = output["ib_uq"]["gate_score"].mean().detach()
+
+        l_gate = torch.tensor(0.0, device=device)
+        apply_wide = (
+            ib_uq_lambda > 0.0
+            and ib_uq_wide_aug != "none"
+            and float(torch.rand(1).item()) <= ib_uq_wide_frac
+        )
+        if apply_wide:
+            batch_wide_dict = build_wide_batch(batch_dict, aug_type=ib_uq_wide_aug)
+            output_wide = model(
+                batch_wide_dict,
+                training=True,
+                compute_force=False,
+                compute_virials=False,
+                compute_stress=False,
+            )
+            if "ib_uq" in output_wide and "gate_score" in output_wide["ib_uq"]:
+                gate_score_wide_tensor = output_wide["ib_uq"]["gate_score"]
+                gate_score_wide = gate_score_wide_tensor.mean().detach()
+                mean_m_wide = 1.0 - gate_score_wide_tensor.mean()
+                l_gate = ib_uq_lambda * mean_m_wide
+
+        loss = loss_sup + l_gate
         loss.backward()
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
@@ -438,7 +494,12 @@ def take_step(
     loss_dict = {
         "loss": to_numpy(loss),
         "time": time.time() - start_time,
+        "L_gate": to_numpy(l_gate),
     }
+    if gate_score_id is not None:
+        loss_dict["train/gate_score_id"] = to_numpy(gate_score_id)
+    if gate_score_wide is not None:
+        loss_dict["train/gate_score_wide"] = to_numpy(gate_score_wide)
 
     return loss, loss_dict
 
@@ -534,7 +595,12 @@ def take_step_lbfgs(
     loss_dict = {
         "loss": to_numpy(loss),
         "time": time.time() - start_time,
+        "L_gate": to_numpy(l_gate),
     }
+    if gate_score_id is not None:
+        loss_dict["train/gate_score_id"] = to_numpy(gate_score_id)
+    if gate_score_wide is not None:
+        loss_dict["train/gate_score_wide"] = to_numpy(gate_score_wide)
 
     return loss, loss_dict
 
@@ -545,6 +611,9 @@ def evaluate(
     data_loader: DataLoader,
     output_args: Dict[str, bool],
     device: torch.device,
+    ib_uq_lambda: float = 0.0,
+    ib_uq_wide_aug: str = "none",
+    ib_uq_wide_frac: float = 1.0,
 ) -> Tuple[float, Dict[str, Any]]:
     for param in model.parameters():
         param.requires_grad = False

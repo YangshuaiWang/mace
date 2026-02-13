@@ -198,6 +198,43 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument(
+        "--ib_uq",
+        help="enable IB-UQ confidence gate head (L=0 latent injection only)",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--ib_uq_dz",
+        help="IB-UQ latent dimension",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--ib_uq_lambda",
+        help="coefficient for wide-distribution gate-close regularization",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--ib_uq_wide_aug",
+        help="wide-distribution augmentation type used for gate-close regularization",
+        type=str,
+        choices=["none", "coord_noise", "cell_scale", "mixed"],
+        default="none",
+    )
+    parser.add_argument(
+        "--ib_uq_wide_frac",
+        help="fraction of training steps that apply wide-distribution gate regularization",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--ib_uq_deterministic",
+        help="use deterministic z0 sampling for IB-UQ reproducibility",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
         "--interaction",
         help="name of interaction block",
         type=str,
