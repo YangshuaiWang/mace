@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, Iterable, List
 
 
@@ -11,12 +12,21 @@ class AlphaSchedule:
     alpha_start: float
     alpha_end: float
     total_steps: int
+    schedule_type: str = "linear"
 
     def value(self, step: int) -> float:
         if self.total_steps <= 1:
             return self.alpha_end
         t = min(max(step, 0), self.total_steps - 1) / (self.total_steps - 1)
-        return self.alpha_start + t * (self.alpha_end - self.alpha_start)
+        if self.schedule_type == "linear":
+            s = t
+        elif self.schedule_type == "cosine":
+            s = 0.5 * (1.0 - math.cos(math.pi * t))
+        elif self.schedule_type == "step":
+            s = 0.0 if step < (self.total_steps - 1) else 1.0
+        else:
+            raise ValueError(f"Unknown schedule type: {self.schedule_type}")
+        return self.alpha_start + s * (self.alpha_end - self.alpha_start)
 
 
 def select_top_groups(group_scores: Dict[str, float], alpha: float) -> List[str]:

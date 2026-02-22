@@ -142,10 +142,17 @@ def main():
 
     base_metrics = eval_metrics(base, batches, device)
     adapted_metrics = eval_metrics(adapted, batches, device)
+    drift = parameter_drift(base, adapted)
     report = {
         "schema_version": "1.0",
         "metrics": with_deltas(base_metrics, adapted_metrics),
-        "parameter_drift": parameter_drift(base, adapted),
+        "parameter_drift": drift,
+        "drift_spectrum": {
+            "schema_version": "1.0",
+            "grouping": "module",
+            "overall_l2": drift["overall_l2"],
+            "per_group_l2": drift["per_group_l2"],
+        },
     }
     print_compact_table(report)
     Path(args.out).write_text(json.dumps(report, indent=2))

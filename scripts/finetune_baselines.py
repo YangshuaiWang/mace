@@ -11,6 +11,7 @@ from typing import Any, Dict
 import yaml
 
 from mace_efggm.repro import (
+    compare_budget,
     compute_budget,
     dump_config,
     make_run_dir,
@@ -90,9 +91,15 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--run_dir_base", default="runs/")
     parser.add_argument("--exp_name", default="baseline_finetune")
+    parser.add_argument("--compare_budget_config", default=None)
     args = parser.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
+    if args.compare_budget_config:
+        other_cfg = yaml.safe_load(Path(args.compare_budget_config).read_text())
+        mismatches = compare_budget(cfg, other_cfg)
+        if mismatches:
+            raise ValueError(f"Compute budget mismatch: {json.dumps(mismatches, indent=2)}")
     logging.basicConfig(level=logging.INFO)
     set_seed(int(cfg.get("seed", 123)))
 

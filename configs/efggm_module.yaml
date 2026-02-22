@@ -19,8 +19,14 @@ budget:
     metric: valid_loss
 efggm:
   grouping: module
-  fisher_steps: 20
-  alpha_start: 0.9
-  alpha_end: 0.3
+  fisher_warmup_batches: 50
+  fisher_ema_beta: 0.95
+  fisher_freeze_after_warmup: true
+  mask_schedule:
+    type: linear
+    alpha_start: 0.9
+    alpha_end: 0.3
+    schedule_steps: 200
+    schedule_interval: 10
 output:
   dir: ./runs/efggm_module
