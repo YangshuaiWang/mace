@@ -18,3 +18,15 @@ def test_alpha_schedule():
     sched = AlphaSchedule(alpha_start=1.0, alpha_end=0.0, total_steps=5)
     assert sched.value(0) == 1.0
     assert sched.value(4) == 0.0
+
+
+def test_alpha_schedule_linear_progression():
+    sched = AlphaSchedule(alpha_start=1.0, alpha_end=0.0, total_steps=5, schedule_type="linear")
+    assert sched.value(2) == 0.5
+
+
+def test_alpha_schedule_step_progression():
+    sched = AlphaSchedule(alpha_start=1.0, alpha_end=0.0, total_steps=5, schedule_type="step")
+    assert sched.value(0) == 1.0
+    assert sched.value(3) == 1.0
+    assert sched.value(4) == 0.0

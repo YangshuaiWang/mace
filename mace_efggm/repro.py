@@ -122,3 +122,27 @@ def print_and_save_budget(budget_report: Dict[str, Any], run_dir: Path) -> None:
 
 def budget_config_to_dict(cfg: BudgetConfig) -> Dict[str, Any]:
     return asdict(cfg)
+
+
+def compare_budget(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Compare critical compute-budget knobs across two configs."""
+    a = budget_config_to_dict(normalize_budget_config(cfg_a))
+    b = budget_config_to_dict(normalize_budget_config(cfg_b))
+    critical_keys = [
+        "optimizer",
+        "lr",
+        "weight_decay",
+        "scheduler",
+        "scheduler_params",
+        "max_steps",
+        "batch_size",
+        "grad_accum_steps",
+        "mixed_precision",
+        "early_stopping_patience",
+        "early_stopping_metric",
+    ]
+    mismatches: Dict[str, Dict[str, Any]] = {}
+    for key in critical_keys:
+        if a.get(key) != b.get(key):
+            mismatches[key] = {"a": a.get(key), "b": b.get(key)}
+    return mismatches
