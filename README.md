@@ -154,6 +154,11 @@ config_type_weights:
 
 And append to the command line `--config="your_configs.yaml"`. Any argument specified in the command line will overwrite the one in the YAML file.
 
+
+### Fine-tuning data-prep quickstart
+
+If you need a copy-paste pipeline to convert user-provided extxyz files into sweep-ready `.pt` batches (train/valid/retention) and select an MD seed structure, see [`docs/QUICKSTART_DATA_PREP.md`](docs/QUICKSTART_DATA_PREP.md).
+
 ### Evaluation
 
 To evaluate your MACE model on an XYZ file, run the `mace_eval_configs`:
