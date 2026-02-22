@@ -1,0 +1,21 @@
+name: baseline_finetune
+seed: 123
+model:
+  foundation_model: small
+data:
+  train_file: ./data/new_domain_train.extxyz
+  valid_file: ./data/new_domain_valid.extxyz
+budget:
+  optimizer: adam
+  lr: 0.001
+  scheduler: ReduceLROnPlateau
+  max_num_epochs: 50
+  batch_size: 8
+  valid_batch_size: 8
+  patience: 10
+baselines:
+  - full_ft
+  - head_only
+  - l2sp
+  - lora
+l2sp_lambda: 1.0

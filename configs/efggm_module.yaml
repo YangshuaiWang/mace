@@ -1,0 +1,16 @@
+seed: 123
+device: cpu
+model:
+  foundation_checkpoint: ./checkpoints/foundation.model
+data:
+  train_batches_pt: ./data/new_domain_train_batches.pt
+budget:
+  steps: 200
+  lr: 0.001
+efggm:
+  grouping: module
+  fisher_steps: 20
+  alpha_start: 0.9
+  alpha_end: 0.3
+output:
+  dir: ./runs/efggm_module
