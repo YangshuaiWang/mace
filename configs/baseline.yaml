@@ -8,11 +8,17 @@ data:
 budget:
   optimizer: adam
   lr: 0.001
+  weight_decay: 0.0
   scheduler: ReduceLROnPlateau
-  max_num_epochs: 50
+  scheduler_params: {}
+  max_steps: 50
   batch_size: 8
   valid_batch_size: 8
-  patience: 10
+  grad_accum_steps: 1
+  mixed_precision: false
+  early_stopping:
+    patience: 10
+    metric: valid_loss
 baselines:
   - full_ft
   - head_only
