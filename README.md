@@ -158,6 +158,7 @@ And append to the command line `--config="your_configs.yaml"`. Any argument spec
 ### Fine-tuning data-prep quickstart
 
 If you need a copy-paste pipeline to convert user-provided extxyz files into sweep-ready `.pt` batches (train/valid/retention) and select an MD seed structure, see [`docs/QUICKSTART_DATA_PREP.md`](docs/QUICKSTART_DATA_PREP.md).
+That quickstart also includes an `extxyz` label validator (`scripts.validate_extxyz_labels`) you can run before batch generation to catch missing keys and NaN/Inf targets early.
 
 ### Evaluation
 
