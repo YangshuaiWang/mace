@@ -16,7 +16,7 @@ from mace_efggm.repro import set_seed
 
 def run_single(args, seed: int):
     set_seed(seed)
-    atoms = read(args.atoms)
+    atoms = read(args.atoms, index=0)
     calc = MACECalculator(model_paths=[args.model], device=args.device)
     atoms.calc = calc
 
@@ -78,7 +78,7 @@ def aggregate(runs: list[dict]):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
-    p.add_argument("--atoms", required=True, help="Path to structure readable by ASE")
+    p.add_argument("--atoms", required=True, help="Path to seed structure (.xyz or .extxyz; first frame is used)")
     p.add_argument("--steps", type=int, default=20)
     p.add_argument("--temperature", type=float, default=300.0)
     p.add_argument("--timestep_fs", type=float, default=0.5)
