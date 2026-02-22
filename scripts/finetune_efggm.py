@@ -50,15 +50,15 @@ def infer_dataset_size(cfg: Dict[str, Any], batches: list[dict]) -> int:
 
 def get_grouping(model, group_mode: str, irreps_grouping: str = "by_l"):
     if group_mode == "module":
-        return module_wise_groups(model.named_parameters()), {"fallback_to_module": False, "unknown_fraction": 0.0, "requested_grouping": group_mode}
+        return module_wise_groups(model.named_parameters()), {"fallback_to_module": False, "unknown_fraction": 0.0, "requested_grouping": group_mode, "irreps_grouping": irreps_grouping}
     if group_mode == "irreps":
         grouped_params = group_params_by_irreps(model, irreps_grouping=irreps_grouping)
         name_lookup = {id(p): n for n, p in model.named_parameters()}
         groups = {g: [name_lookup[id(p)] for p in params if id(p) in name_lookup] for g, params in grouped_params.items()}
         total = sum(p.numel() for p in model.parameters())
         unknown = sum(p.numel() for p in grouped_params.get("irrep_unknown", []))
-        return groups, {"fallback_to_module": False, "unknown_fraction": (unknown / total if total else 0.0), "requested_grouping": group_mode}
-    return irreps_wise_groups(model.named_parameters()), {"fallback_to_module": False, "unknown_fraction": 0.0, "requested_grouping": group_mode}
+        return groups, {"fallback_to_module": False, "unknown_fraction": (unknown / total if total else 0.0), "requested_grouping": group_mode, "irreps_grouping": irreps_grouping}
+    return irreps_wise_groups(model.named_parameters()), {"fallback_to_module": False, "unknown_fraction": 0.0, "requested_grouping": group_mode, "irreps_grouping": irreps_grouping}
 
 
 def compute_mask_coverage(model, groups: Dict[str, list[str]], kept: set[str], grouping: str) -> Dict[str, Any]:
@@ -296,6 +296,16 @@ def train(cfg: dict, run_dir: Path) -> None:
     drift_spectrum = compute_drift_spectrum(model, initial_state, groups, grouping_meta["resolved_grouping"])
     drift_spectrum["grouping_meta"] = grouping_meta
     (run_dir / "drift_spectrum.json").write_text(json.dumps(drift_spectrum, indent=2))
+
+    grouping_diagnostics = {
+        "grouping_mode_requested": group_mode,
+        "irreps_grouping": irreps_grouping,
+        "unknown_fraction": grouping_meta.get("unknown_fraction", 0.0),
+        "fallback_used": bool(grouping_meta.get("fallback_to_module", False)),
+        "groups_kept": int(mask_coverage["num_groups_kept"]),
+        "params_trainable": int(mask_coverage["num_params_trainable"]),
+    }
+    (run_dir / "grouping_diagnostics.json").write_text(json.dumps(grouping_diagnostics, indent=2))
 
     if group_mode == "irreps" and not grouping_meta.get("fallback_to_module"):
         fisher_spectrum = compute_irreps_spectrum_from_groups(current_scores, model, groups)
