@@ -1,9 +1,10 @@
 name: baseline_finetune
 seed: 0
 model:
-  foundation_model: small
+  foundation_checkpoint: ./checkpoints/foundation.model
 data:
   train_batches_pt: ./data/new_domain_train_batches.pt
+  # valid_batches_pt: ./data/new_domain_valid_batches.pt
 budget:
   optimizer: adam
   lr: 0.001
@@ -22,5 +23,5 @@ baselines:
   - full_ft
   - head_only
   - l2sp
-# - lora  # excluded from publication sweep until stability is confirmed
+# - lora  # optional; falls back to full_ft semantics if enabled
 l2sp_lambda: 1.0
