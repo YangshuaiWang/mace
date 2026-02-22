@@ -48,13 +48,19 @@ def aggregate_run(run_dir: Path) -> Dict[str, Any] | None:
     retention = read_json(run_dir / "retention.json")
     md = read_json(run_dir / "md_stability.json")
     drift_spectrum = read_json(run_dir / "drift_spectrum.json")
+    fisher_spectrum = read_json(run_dir / "fisher_spectrum.json")
+    drift_spectrum_irreps = read_json(run_dir / "drift_spectrum_irreps.json")
 
     method = cfg.get("method") or cfg.get("name") or cfg.get("exp_name") or run_dir.name
     stress_new = get_metric(metrics, ["new", "stress", "rmse"])
     if stress_new is None:
         stress_new = get_metric(metrics, ["new_stress_rmse"])
 
-    return {
+    grouping = get_metric(cfg, ["efggm", "grouping", "mode"]) or get_metric(cfg, ["efggm", "grouping"])
+    if isinstance(grouping, dict):
+        grouping = grouping.get("mode")
+
+    row = {
         "exp_name": run_dir.name,
         "method": method,
         "seed": cfg.get("seed"),
@@ -69,7 +75,13 @@ def aggregate_run(run_dir: Path) -> Dict[str, Any] | None:
         "md_failure_rate": get_metric(md, ["aggregate", "failure_count", "mean"], get_metric(md, ["failure_rate"])),
         "md_energy_drift_max_abs": get_metric(md, ["aggregate", "energy_drift_max_abs", "mean"], get_metric(md, ["energy_drift", "max_abs"])),
         "param_drift_l2": get_metric(retention, ["parameter_drift", "overall_l2"], get_metric(drift_spectrum, ["overall_l2"])),
+        "grouping_mode": grouping,
     }
+    if isinstance(fisher_spectrum, list):
+        row["fisher_spectrum"] = json.dumps(fisher_spectrum)
+    if isinstance(drift_spectrum_irreps, list):
+        row["drift_spectrum_irreps"] = json.dumps(drift_spectrum_irreps)
+    return row
 
 
 def print_table(rows: list[Dict[str, Any]]) -> None:

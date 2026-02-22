@@ -5,12 +5,31 @@ model:
 data:
   train_batches_pt: ./data/new_domain_train_batches.pt
 budget:
-  steps: 200
+  optimizer: adam
   lr: 0.001
+  weight_decay: 0.0
+  scheduler: none
+  scheduler_params: {}
+  max_steps: 200
+  batch_size: 1
+  grad_accum_steps: 1
+  mixed_precision: false
+  early_stopping:
+    patience: 0
+    metric: valid_loss
 efggm:
-  grouping: irreps
-  fisher_steps: 20
-  alpha_start: 0.9
-  alpha_end: 0.3
+  grouping:
+    mode: irreps
+    irreps_grouping: by_l
+  unknown_fallback_threshold: 0.5
+  fisher_warmup_batches: 50
+  fisher_ema_beta: 0.95
+  fisher_freeze_after_warmup: true
+  mask_schedule:
+    type: linear
+    alpha_start: 0.9
+    alpha_end: 0.3
+    schedule_steps: 200
+    schedule_interval: 10
 output:
   dir: ./runs/efggm_irreps
