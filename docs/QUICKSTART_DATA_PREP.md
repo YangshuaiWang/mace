@@ -21,6 +21,38 @@ Put your files here:
   - or one file to split: `./data/new_domain.extxyz`
 - Old-domain held-out benchmark extxyz: `./data/old_domain_retention.extxyz`
 
+## Validate your extxyz first
+
+Run this once per input file to verify label keys, finite values, and basic magnitudes before generating `.pt` batches:
+
+```bash
+PYTHONPATH=. python -m scripts.validate_extxyz_labels \
+  --extxyz ./data/new_domain_train.extxyz \
+  --energy_keys "energy,ref_energy,REF_energy" \
+  --forces_keys "forces,ref_forces,REF_forces" \
+  --stress_keys "stress,virial,REF_stress" \
+  --out ./data/new_domain_train_validation.json
+```
+
+Example for retention data:
+
+```bash
+PYTHONPATH=. python -m scripts.validate_extxyz_labels --extxyz ./data/old_domain_retention.extxyz
+```
+
+If validation fails, the script prints actionable errors with the keys it expected and the keys it found.
+
+Before launching `run_sweep`, run the one-command preflight sanity workflow (labels, batch-schema path, smoke finetunes, and seed structure checks):
+
+```bash
+PYTHONPATH=. python scripts/sanity_check_preflight.py \
+  --new_extxyz ./data/new_domain.extxyz \
+  --retention_extxyz ./data/old_domain_retention.extxyz \
+  --foundation_checkpoint ./checkpoints/foundation.model
+```
+
+This check is strongly recommended before large-scale sweeps.
+
 ## 1) Build train/valid batch `.pt` files
 
 ### Option A: train + valid extxyz are already separate
