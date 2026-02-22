@@ -1,27 +1,26 @@
 name: baseline_finetune
-seed: 123
+seed: 0
 model:
   foundation_model: small
 data:
-  train_file: ./data/new_domain_train.extxyz
-  valid_file: ./data/new_domain_valid.extxyz
+  train_batches_pt: ./data/new_domain_train_batches.pt
 budget:
   optimizer: adam
   lr: 0.001
   weight_decay: 0.0
-  scheduler: ReduceLROnPlateau
+  scheduler: none
   scheduler_params: {}
-  max_steps: 50
-  batch_size: 8
-  valid_batch_size: 8
+  max_steps: 200
+  batch_size: 1
+  valid_batch_size: 1
   grad_accum_steps: 1
   mixed_precision: false
   early_stopping:
-    patience: 10
+    patience: 0
     metric: valid_loss
 baselines:
   - full_ft
   - head_only
   - l2sp
-  - lora
+# - lora  # excluded from publication sweep until stability is confirmed
 l2sp_lambda: 1.0
