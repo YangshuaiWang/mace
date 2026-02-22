@@ -18,6 +18,7 @@ from mace_efggm import (
     MaskedOptimizerWrapper,
     build_parameter_mask,
     group_scores,
+    group_params_by_irreps,
     irreps_wise_groups,
     module_wise_groups,
     select_top_groups,
@@ -47,10 +48,17 @@ def infer_dataset_size(cfg: Dict[str, Any], batches: list[dict]) -> int:
     return len(batches)
 
 
-def get_grouping(model, group_mode: str):
+def get_grouping(model, group_mode: str, irreps_grouping: str = "by_l"):
     if group_mode == "module":
-        return module_wise_groups(model.named_parameters())
-    return irreps_wise_groups(model.named_parameters())
+        return module_wise_groups(model.named_parameters()), {"fallback_to_module": False, "unknown_fraction": 0.0, "requested_grouping": group_mode}
+    if group_mode == "irreps":
+        grouped_params = group_params_by_irreps(model, irreps_grouping=irreps_grouping)
+        name_lookup = {id(p): n for n, p in model.named_parameters()}
+        groups = {g: [name_lookup[id(p)] for p in params if id(p) in name_lookup] for g, params in grouped_params.items()}
+        total = sum(p.numel() for p in model.parameters())
+        unknown = sum(p.numel() for p in grouped_params.get("irrep_unknown", []))
+        return groups, {"fallback_to_module": False, "unknown_fraction": (unknown / total if total else 0.0), "requested_grouping": group_mode}
+    return irreps_wise_groups(model.named_parameters()), {"fallback_to_module": False, "unknown_fraction": 0.0, "requested_grouping": group_mode}
 
 
 def compute_mask_coverage(model, groups: Dict[str, list[str]], kept: set[str], grouping: str) -> Dict[str, Any]:
@@ -115,6 +123,23 @@ def compute_drift_spectrum(model, initial_state: Dict[str, torch.Tensor], groups
     }
 
 
+
+
+def compute_irreps_spectrum_from_groups(values_by_group: Dict[str, float], model, groups: Dict[str, list[str]]) -> list[dict[str, Any]]:
+    params = dict(model.named_parameters())
+    per_l: Dict[str, Dict[str, float]] = {}
+    for group, value in values_by_group.items():
+        if not group.startswith("irrep_l"):
+            continue
+        l = group.split("::", 1)[0].replace("irrep_l", "")
+        bucket = per_l.setdefault(l, {"sum": 0.0, "param_count": 0})
+        bucket["sum"] += float(value)
+        bucket["param_count"] += int(sum(params[n].numel() for n in groups.get(group, []) if n in params))
+    return [
+        {"l": int(l), "value": stats["sum"], "param_count": int(stats["param_count"])}
+        for l, stats in sorted(per_l.items(), key=lambda kv: int(kv[0]))
+    ]
+
 def train(cfg: dict, run_dir: Path) -> None:
     set_seed(int(cfg.get("seed", 123)))
     device = torch.device(cfg.get("device", "cpu"))
@@ -127,7 +152,14 @@ def train(cfg: dict, run_dir: Path) -> None:
     total_steps = int(budget_cfg.max_steps)
 
     efggm = cfg.get("efggm", {})
-    group_mode = efggm.get("grouping", "module")
+    grouping_cfg = efggm.get("grouping", "module")
+    if isinstance(grouping_cfg, dict):
+        group_mode = grouping_cfg.get("mode", "module")
+        irreps_grouping = grouping_cfg.get("irreps_grouping", "by_l")
+    else:
+        group_mode = grouping_cfg
+        irreps_grouping = efggm.get("irreps_grouping", "by_l")
+    unknown_fallback_threshold = float(efggm.get("unknown_fallback_threshold", 0.5))
     fisher_warmup_batches = int(efggm.get("fisher_warmup_batches", 50))
     fisher_ema_beta = float(efggm.get("fisher_ema_beta", 0.95))
     fisher_freeze = bool(efggm.get("fisher_freeze_after_warmup", True))
@@ -146,7 +178,13 @@ def train(cfg: dict, run_dir: Path) -> None:
     print_and_save_budget(budget_report, run_dir)
 
     fisher = FisherEMA(model.named_parameters(), config=FisherEMAConfig(beta=fisher_ema_beta))
-    groups = get_grouping(model, group_mode)
+    groups, grouping_meta = get_grouping(model, group_mode, irreps_grouping=irreps_grouping)
+    if group_mode == "irreps" and grouping_meta["unknown_fraction"] > unknown_fallback_threshold:
+        logging.warning("Unknown irreps fraction %.3f exceeds threshold %.3f; falling back to module grouping.", grouping_meta["unknown_fraction"], unknown_fallback_threshold)
+        groups, _ = get_grouping(model, "module")
+        grouping_meta["fallback_to_module"] = True
+        grouping_meta["fallback_reason"] = "unknown_fraction_exceeded"
+    grouping_meta["resolved_grouping"] = ("module" if grouping_meta.get("fallback_to_module") else group_mode)
 
     opt = torch.optim.Adam(
         model.parameters(),
@@ -252,8 +290,28 @@ def train(cfg: dict, run_dir: Path) -> None:
     torch.save(model, run_dir / "final_model.pt")
     (run_dir / "mask.json").write_text(json.dumps(current_mask, indent=2))
     (run_dir / "fisher_group_scores.json").write_text(json.dumps(current_scores, indent=2))
-    (run_dir / "mask_coverage.json").write_text(json.dumps(compute_mask_coverage(model, groups, kept_groups, group_mode), indent=2))
-    (run_dir / "drift_spectrum.json").write_text(json.dumps(compute_drift_spectrum(model, initial_state, groups, group_mode), indent=2))
+    mask_coverage = compute_mask_coverage(model, groups, kept_groups, grouping_meta["resolved_grouping"])
+    mask_coverage["grouping_meta"] = grouping_meta
+    (run_dir / "mask_coverage.json").write_text(json.dumps(mask_coverage, indent=2))
+    drift_spectrum = compute_drift_spectrum(model, initial_state, groups, grouping_meta["resolved_grouping"])
+    drift_spectrum["grouping_meta"] = grouping_meta
+    (run_dir / "drift_spectrum.json").write_text(json.dumps(drift_spectrum, indent=2))
+
+    if group_mode == "irreps" and not grouping_meta.get("fallback_to_module"):
+        fisher_spectrum = compute_irreps_spectrum_from_groups(current_scores, model, groups)
+        drift_raw = {}
+        params = dict(model.named_parameters())
+        for group, names in groups.items():
+            sq = 0.0
+            for name in names:
+                if name not in params or name not in initial_state:
+                    continue
+                diff = params[name].detach() - initial_state[name]
+                sq += float((diff**2).sum().item())
+            drift_raw[group] = sq**0.5
+        drift_irreps = compute_irreps_spectrum_from_groups(drift_raw, model, groups)
+        (run_dir / "fisher_spectrum.json").write_text(json.dumps([{"l": x["l"], "fisher_sum": x["value"], "param_count": x["param_count"]} for x in fisher_spectrum], indent=2))
+        (run_dir / "drift_spectrum_irreps.json").write_text(json.dumps([{"l": x["l"], "drift_l2_sum": x["value"], "param_count": x["param_count"]} for x in drift_irreps], indent=2))
 
 
 def main() -> None:
